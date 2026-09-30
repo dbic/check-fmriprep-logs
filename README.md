@@ -31,6 +31,12 @@ as a console table, a CSV, and an HTML report.
 │ 003156  │ 20260807 │ 1102_MedMap │  ✔ Successful   │ successful                           │
 └─────────┴──────────┴─────────────┴─────────────────┴──────────────────────────────────────┘
 ```
+Note: in a terminal, this renders as a colorized `rich` table, which 
+importantly makes characters like ✔/❌ function correctly as if they were
+monospaced. Here, in a plain Markdown 
+code block, spacing can be unreliable across browsers due to font issues (the
+glyphs ❌ and ✔ don't always have consistent character widths outside a
+real terminal, so the copy-pasted table above may look "ragged" here).
 
 The CSV carries the same rows (plus `stdout_path`/`stderr_path`/
 `derivatives_found` columns); the HTML report adds clickable links to each
