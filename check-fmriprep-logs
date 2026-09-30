@@ -1,0 +1,1022 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# check_fmriprep_logs
+# ~~~~~~~~~~~~~~~~~~~~
+#
+# 2026-08-10  add --log-root arg, new 'root cause' category of errors  (WASABI version)
+# 2026-09-29  rewrite: project-agnostic defaults, config discovery, interactive
+#             fallback, expanded/refactored error catalog, derivatives
+#             cross-check, per-subject rollup, richer HTML report, optional
+#             tqdm/rich dependencies, more robust per-file error handling.
+#
+# This tool grew out of auditing fMRIPrep runs for one specific project
+# (internally "WASABI"). This version removes every WASABI-specific default;
+# see wasabi.example.yaml for a config that reproduces the original behavior.
+
+"""
+check_fmriprep_logs
+~~~~~~~~~~~~~~~~~~~~
+
+Read fMRIPrep stdout/stderr logs, classify each run as Successful / Failed /
+In Progress / Unfinished, optionally cross-check against derivatives on disk,
+and write a CSV + HTML summary.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+import pandas as pd
+import yaml
+
+# ----------------------------------------------------------------------
+# Optional dependencies: tqdm (progress bar) and rich (colored console
+# output) are nice-to-have, not essential. Fall back gracefully so the
+# script still runs somewhere they aren't installed.
+# ----------------------------------------------------------------------
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    HAVE_RICH = True
+except ImportError:  # pragma: no cover
+    HAVE_RICH = False
+
+    class Console:  # minimal stand-in with the subset of the API we use
+        def print(self, *args, **kwargs):
+            # Strip rich markup like "[red]...[/]" so plain-print output
+            # doesn't come out littered with bracket tags.
+            plain = []
+            for a in args:
+                if isinstance(a, str):
+                    a = re.sub(r"\[/?[a-zA-Z0-9 _]*\]", "", a)
+                plain.append(a)
+            print(*plain, **{k: v for k, v in kwargs.items() if k not in ("style",)})
+
+    Table = None  # terminal table just won't be drawn; CSV/HTML still are
+
+
+# ----------------------------------------------------------------------
+# Config file names auto-discovered in the current directory if --config
+# is not given explicitly. First one found wins.
+# ----------------------------------------------------------------------
+AUTO_CONFIG_NAMES = [
+    "fmriprep_log_check.yaml",
+    "fmriprep_log_check.yml",
+    "fmriprep_log_check.json",
+    ".fmriprep_log_check.yaml",
+    ".fmriprep_log_check.yml",
+    ".fmriprep_log_check.json",
+]
+
+# ----------------------------------------------------------------------
+#  CONFIG DEFAULTS
+#  Deliberately project-agnostic. Point --log-root / a config file at
+#  whatever you need; see wasabi.example.yaml for a worked example that
+#  reproduces the settings this script originally shipped with.
+# ----------------------------------------------------------------------
+DEFAULT_CFG: Dict[str, Any] = {
+    # Where to look for logs. None => resolved at runtime (cwd, or an
+    # interactive prompt if the terminal is interactive).
+    "log_root": None,
+    "log_glob": "*.txt",
+    "log_recursive": False,
+    "err_suffix": "_err.txt",
+
+    # Two independent, optional patterns searched against the *filename*.
+    # Split like this (rather than one combined regex) so that differing
+    # naming conventions -- "sub-01_..." vs "..._sid01_..." vs date-first
+    # vs date-last -- don't require rewriting one fragile expression.
+    # Each must have exactly the named group shown.
+    "sid_pattern": r"sub-(?P<sid>[A-Za-z0-9]+)",
+    "date_pattern": r"(?P<date>\d{8})",
+
+    # Optional: cross-check derivatives on disk against subjects that
+    # report "Successful" in the logs. Leave deriv_root unset to skip.
+    "deriv_root": None,
+    "study_subdirs": [],           # if set, index derivatives per subdir
+    "deriv_patterns": [
+        r"sub-(?P<sid>[A-Za-z0-9]+).*_desc-preproc_T1w\.nii\.gz$",
+    ],
+
+    # Optional: map a BIDS root path (as printed by fMRIPrep in
+    # "* BIDS dataset path: ...") to a human-readable study label.
+    "bids_path_map": [],
+
+    "html_title": "fMRIPrep Log Audit",
+    "date_start": None,   # YYYYMMDD
+    "date_end": None,
+    "out_dir": None,       # None => alongside log_root (log_root.parent)
+}
+
+# "Error" patterns that are known-harmless noise and should never be
+# treated as evidence of failure.
+DEFAULT_IGNORE_PATTERNS: List[str] = [
+    r"Fontconfig\s+error:",
+]
+
+
+# ----------------------------------------------------------------------
+# Error catalog
+#
+# Each rule is checked, in order, against every candidate line. The first
+# rule that matches a given line "wins" for that line (we don't keep
+# checking lower-priority rules against the same line) -- so put more
+# specific patterns before more generic ones. A rule with stop_scan=True
+# means: once this fires, stop reading the rest of the log entirely,
+# because the failure is a root cause likely to cascade into other,
+# less informative errors (e.g. a cancelled job will often also look
+# like a FileNotFoundError further down).
+#
+# label may be a plain string, or a callable(match) -> str if you want to
+# fold matched text (e.g. the SLURM cancellation reason) into the label.
+#
+# This list is deliberately broader than what we've actually seen fail --
+# several entries are speculative, based on common, well-documented
+# fMRIPrep/Nipype/SLURM/Apptainer failure modes, since a single project's
+# history is unlikely to be exhaustive. Treat any label you never see
+# fire as free to prune, and add more as new failure modes turn up.
+# ----------------------------------------------------------------------
+
+LabelFn = Callable[[re.Match], str]
+
+
+@dataclass
+class ErrorRule:
+    pattern: re.Pattern
+    label: str
+    stop_scan: bool = False
+    label_fn: Optional[LabelFn] = None
+
+    def match_label(self, line: str) -> Optional[str]:
+        m = self.pattern.search(line)
+        if not m:
+            return None
+        return self.label_fn(m) if self.label_fn else self.label
+
+
+def _rule(pattern: str, label: str, stop_scan: bool = False, label_fn: Optional[LabelFn] = None) -> ErrorRule:
+    return ErrorRule(re.compile(pattern, re.I), label, stop_scan, label_fn)
+
+
+ERROR_CATALOG: List[ErrorRule] = [
+    # ---- SLURM job-control failures -----------------------------------
+    # More specific "why was it cancelled" checks first, generic fallback last.
+    _rule(r"CANCELLED AT.*DUE TO TIME LIMIT", "Job cancelled (time limit)", stop_scan=True),
+    _rule(r"CANCELLED AT.*DUE TO NODE FAILURE", "Job cancelled (node failure)", stop_scan=True),
+    _rule(r"CANCELLED AT.*(DUE TO )?.*OOM", "Job cancelled (out of memory)", stop_scan=True),
+    _rule(r"\bCANCELLED AT\b", "Job cancelled", stop_scan=True),
+    _rule(r"\bDUE TO NODE FAILURE\b", "Job cancelled (node failure)", stop_scan=True),
+    _rule(r"\bdetected \d+ oom.?kill event", "Job killed (out of memory, cgroup)", stop_scan=True),
+    _rule(r"\boom.?kill", "Job killed (out of memory)", stop_scan=True),
+
+    # ---- Container / environment failures -----------------------------
+    _rule(r"\bcontainer creation failed\b", "Container error", stop_scan=True),
+    _rule(r"FATAL:.*(image file|no such file)", "Container image not found", stop_scan=True),
+    _rule(r"FATAL:.*permission denied", "Container permission error", stop_scan=True),
+
+    # ---- Filesystem / storage failures ---------------------------------
+    _rule(r"No space left on device", "Disk full", stop_scan=True),
+    _rule(r"Disk quota exceeded", "Disk quota exceeded", stop_scan=True),
+    _rule(r"Stale file handle", "Stale NFS handle", stop_scan=True),
+    _rule(r"Read-only file system", "Read-only filesystem", stop_scan=True),
+
+    # ---- Licensing / setup problems (speculative but common) -----------
+    _rule(r"freesurfer license.*(not found|invalid|missing)", "FreeSurfer license missing/invalid", stop_scan=True),
+    _rule(r"license\.txt.*not found", "FreeSurfer license missing/invalid", stop_scan=True),
+
+    # ---- FreeSurfer / midthickness failures -----------------------------
+    _rule(r"\*\*\* buffer overflow detected \*\*\*", "FreeSurfer buffer overflow", stop_scan=True),
+    _rule(r"RuntimeError: subprocess exited with code\s*134", "FreeSurfer crash (code134)", stop_scan=True),
+    _rule(r"Node _midthickness0 failed", "FreeSurfer node failure", stop_scan=True),
+
+    # ---- BIDS / input data problems -------------------------------------
+    _rule(r"BIDS validation failed", "BIDS validation failed", stop_scan=False),
+    _rule(r"Invalid BIDSLayout", "Invalid BIDS layout", stop_scan=False),
+    _rule(r"Multiple T1w images (found|were found)", "Multiple/ambiguous T1w images", stop_scan=False),
+    _rule(r"\bFileNotFoundError\b.*t1w", "No T1w images found", stop_scan=False),
+    _rule(r"\bFileNotFoundError\b", "File not found", stop_scan=False),
+
+    # ---- Generic Nipype / Python / OS failures ---------------------------
+    _rule(r"\bSegmentation fault\b", "Segmentation fault", stop_scan=False),
+    _rule(r"\bMemoryError\b", "Python MemoryError", stop_scan=False),
+    _rule(r"\bBroken pipe\b", "Broken pipe", stop_scan=False),
+    _rule(r"\bKilled\b", "Process killed", stop_scan=False),
+    _rule(r"Traceback \(most recent call last\)", "Unhandled Python exception", stop_scan=False),
+    _rule(r"\bERROR\b", "General error (ERROR)", stop_scan=False),
+]
+
+
+def build_ignore_patterns(cfg: Dict[str, Any]) -> List[re.Pattern]:
+    raw = cfg.get("ignore_patterns", DEFAULT_IGNORE_PATTERNS)
+    return [re.compile(p, re.I) for p in raw]
+
+
+# ----------------------------------------------------------------------
+# Content-based fallback for subject-id extraction.
+#
+# sid_pattern/date_pattern are matched against the *filename* first, since
+# that's cheap and usually sufficient. When a file's name doesn't match --
+# e.g. a naming convention nobody's told the config about yet -- rather
+# than silently skipping it, we check whether it actually looks like an
+# fMRIPrep log at all (via SIGNATURE_PATTERNS), and if so, try a short list
+# of common id conventions against its first ~60 lines. This is a guess,
+# not a substitute for a correct sid_pattern, so any file id found this way
+# is logged (in --debug) as "from content", and the recommended fix if it
+# fires a lot is still to set sid_pattern in a config.
+# ----------------------------------------------------------------------
+SIGNATURE_PATTERNS: List[re.Pattern] = [
+    re.compile(r"Running fMRIPrep version", re.I),
+    re.compile(r"nipype\.workflow", re.I),
+    re.compile(r"\bfmriprep-\d", re.I),
+]
+
+FALLBACK_SID_PATTERNS: List[re.Pattern] = [
+    re.compile(r"sub-(?P<sid>[A-Za-z0-9]+)", re.I),
+    re.compile(r"(?i:sid)[-_]?(?P<sid>\d+)"),
+    re.compile(r"participant(?:[-_ ]?label)?[:=]?\s*(?P<sid>[A-Za-z0-9]+)", re.I),
+]
+
+HEAD_SCAN_LINES = 60
+
+
+def _head_text(path: Path, n_lines: int = HEAD_SCAN_LINES) -> str:
+    lines: List[str] = []
+    try:
+        with path.open(errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= n_lines:
+                    break
+                lines.append(line)
+    except OSError:
+        pass
+    return "".join(lines)
+
+
+def looks_like_fmriprep_log(head_text: str) -> bool:
+    return any(p.search(head_text) for p in SIGNATURE_PATTERNS)
+
+
+def sid_from_content(head_text: str) -> Optional[str]:
+    for pat in FALLBACK_SID_PATTERNS:
+        m = pat.search(head_text)
+        if m:
+            return m.group("sid")
+    return None
+
+
+# ----------------------------------------------------------------------
+#  Argument parsing
+# ----------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Summarize fMRIPrep logs and check run statuses.",
+        epilog=(
+            "Config is resolved in this order: CLI flags > --config file > "
+            "a fmriprep_log_check.yaml/.json found in the current directory > "
+            "built-in defaults. With no log_root configured at all, you'll be "
+            "prompted interactively (or told what to pass, if not interactive)."
+        ),
+    )
+    p.add_argument("-c", "--config", type=str, help="Path to a YAML or JSON config file.")
+    p.add_argument("--log-root", type=str, help="Directory containing the logs (overrides config).")
+    p.add_argument("--log-glob", type=str, help="Glob for log files, e.g. '*.txt' (default: *.txt).")
+    p.add_argument("--recursive", action="store_true", default=None,
+                    help="Search log-root recursively for matching files.")
+    p.add_argument("--out-dir", type=str, help="Where to write the CSV/HTML report (default: next to log-root).")
+    p.add_argument("--start-date", type=str, help="Only consider logs on or after this date (YYYYMMDD).")
+    p.add_argument("--end-date", type=str, help="Upper bound for log dates (inclusive, YYYYMMDD).")
+    p.add_argument("--title", type=str, help="Title used in the HTML report.")
+    p.add_argument("--only", choices=["all", "successful", "failed", "in-progress", "unfinished"],
+                    default="all", help="Filter the terminal/HTML report to one status (CSV always has everything).")
+    p.add_argument("--include", type=str, help="Only process log files whose name contains this string.")
+    p.add_argument("--exclude", type=str, help="Skip log files whose name contains this string.")
+    p.add_argument("--no-input", action="store_true",
+                    help="Never prompt interactively; fail with an error if log-root can't be resolved.")
+    p.add_argument("-d", "--debug", action="store_true", help="Print verbose debugging information.")
+    return p
+
+
+def load_cfg_from_file(cfg_path: Path) -> Dict[str, Any]:
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+    if cfg_path.suffix.lower() in (".yaml", ".yml"):
+        with cfg_path.open() as f:
+            return yaml.safe_load(f) or {}
+    elif cfg_path.suffix.lower() == ".json":
+        with cfg_path.open() as f:
+            return json.load(f)
+    else:
+        raise ValueError("Config file must be .yaml/.yml or .json")
+
+
+def discover_local_config() -> Optional[Path]:
+    """Look for a config file with a known name in the current directory."""
+    for name in AUTO_CONFIG_NAMES:
+        candidate = Path.cwd() / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def merge_cfg(default: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    """Shallow merge -- keys in *update* replace those in *default*."""
+    cfg = default.copy()
+    cfg.update(update or {})
+    return cfg
+
+
+def resolve_log_root_interactively(no_input: bool, console: Console) -> Path:
+    """
+    Called only when no log_root came from CLI flags, an explicit config
+    file, an auto-discovered config file, or the environment. Never runs
+    unless stdin is a TTY and --no-input wasn't passed.
+    """
+    cwd = Path.cwd()
+    if no_input or not sys.stdin.isatty():
+        console.print(
+            "[red]No log directory configured.[/] Pass --log-root PATH, "
+            "or --config FILE, or add a fmriprep_log_check.yaml to the "
+            "current directory."
+        )
+        sys.exit(2)
+
+    console.print(f"[yellow]No log directory configured.[/] Current directory is: {cwd}")
+    console.print("  1) Use the current directory")
+    console.print("  2) Enter a path")
+    console.print("  3) Abort")
+    choice = input("Choose [1/2/3]: ").strip()
+
+    if choice == "1":
+        return cwd
+    elif choice == "2":
+        raw = input("Path to log directory: ").strip()
+        if not raw:
+            console.print("[red]No path entered, aborting.[/]")
+            sys.exit(2)
+        return Path(raw).expanduser()
+    else:
+        console.print("Aborted.")
+        sys.exit(1)
+
+
+def initialize_cfg(argv: Optional[List[str]] = None) -> Tuple[Dict[str, Any], argparse.Namespace, Console]:
+    args = build_parser().parse_args(argv)
+    console = Console()
+
+    cfg: Dict[str, Any] = DEFAULT_CFG.copy()
+    used_config_path: Optional[Path] = None
+
+    if args.config:
+        used_config_path = Path(args.config)
+        try:
+            cfg = merge_cfg(cfg, load_cfg_from_file(used_config_path))
+        except (FileNotFoundError, ValueError, yaml.YAMLError, json.JSONDecodeError) as exc:
+            console.print(f"[red]Could not load config file {used_config_path}: {exc}[/]")
+            sys.exit(2)
+    else:
+        auto = discover_local_config()
+        if auto:
+            used_config_path = auto
+            try:
+                cfg = merge_cfg(cfg, load_cfg_from_file(auto))
+            except (FileNotFoundError, ValueError, yaml.YAMLError, json.JSONDecodeError) as exc:
+                console.print(f"[red]Could not load auto-discovered config file {auto}: {exc}[/]")
+                sys.exit(2)
+
+    # CLI flags win over any config file.
+    if args.log_root:
+        cfg["log_root"] = args.log_root
+    if args.log_glob:
+        cfg["log_glob"] = args.log_glob
+    if args.recursive is not None:
+        cfg["log_recursive"] = args.recursive
+    if args.out_dir:
+        cfg["out_dir"] = args.out_dir
+    if args.start_date:
+        cfg["date_start"] = args.start_date
+    if args.end_date:
+        cfg["date_end"] = args.end_date
+    if args.title:
+        cfg["html_title"] = args.title
+
+    if args.debug:
+        if used_config_path:
+            console.print(f"[cyan]Using config file:[/] {used_config_path}")
+        else:
+            console.print("[cyan]No config file found; using built-in defaults + CLI flags.[/]")
+
+    # Resolve log_root: explicit config/CLI value, else interactive/careful fallback.
+    if not cfg.get("log_root"):
+        cfg["log_root"] = str(resolve_log_root_interactively(args.no_input, console))
+
+    log_root = Path(cfg["log_root"]).expanduser()
+    if not log_root.is_dir():
+        console.print(f"[red]log_root does not exist or is not a directory:[/] {log_root}")
+        sys.exit(2)
+    cfg["log_root"] = str(log_root)
+
+    if cfg.get("out_dir"):
+        out_dir = Path(cfg["out_dir"]).expanduser()
+    else:
+        out_dir = log_root.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg["out_dir"] = str(out_dir)
+
+    cfg["sid_re"] = re.compile(cfg["sid_pattern"])
+    cfg["date_re"] = re.compile(cfg["date_pattern"])
+    cfg["deriv_pattern_res"] = [re.compile(p, re.I) for p in cfg.get("deriv_patterns", [])]
+    cfg["ignore_res"] = build_ignore_patterns(cfg)
+    cfg["bids_line_re"] = re.compile(r"\* BIDS dataset path:\s*(?P<path>\S+)", re.I)
+
+    cfg["date_start_dt"] = (
+        datetime.strptime(cfg["date_start"], "%Y%m%d").date() if cfg.get("date_start") else None
+    )
+    cfg["date_end_dt"] = (
+        datetime.strptime(cfg["date_end"], "%Y%m%d").date() if cfg.get("date_end") else None
+    )
+
+    return cfg, args, console
+
+
+# ----------------------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------------------
+def study_from_log(stdout_path: Path, cfg: Dict[str, Any]) -> Optional[str]:
+    """Scan the stdout log for fMRIPrep's '* BIDS dataset path: <path>' line."""
+    bids_map = cfg.get("bids_path_map") or []
+    if not bids_map:
+        return None
+    try:
+        with stdout_path.open(errors="replace") as f:
+            for line in f:
+                m = cfg["bids_line_re"].search(line)
+                if m:
+                    bids_path = m.group("path").rstrip(".")
+                    for entry in bids_map:
+                        if bids_path.startswith(entry["bids_root"]):
+                            return entry["study"]
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def _tail_text(path: Path, size: int = 65536) -> str:
+    """Read (up to) the last `size` bytes of a file, decoded leniently."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            fsize = f.tell()
+            f.seek(max(0, fsize - size))
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def parse_log_pair(
+    stdout_file: Path,
+    stderr_file: Optional[Path],
+    cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Return (success_flag, message)."""
+    success_marker = re.compile(r"fmriprep.*finished successfully", re.I)
+
+    # fMRIPrep's success line is printed right near the end of stdout.
+    # Nipype workflow logs can run into the hundreds of MB, and the vast
+    # majority of that is only relevant if the run actually failed, so
+    # check the tail first: if it's there, we're done and never need to
+    # read (let alone regex-scan) the rest of a potentially huge file.
+    if success_marker.search(_tail_text(stdout_file, cfg.get("success_tail_bytes", 65536))):
+        return True, "successful"
+
+    with stdout_file.open(errors="replace") as f:
+        stdout_lines = [ln.rstrip() for ln in f]
+
+    success = any(success_marker.search(l) for l in stdout_lines)
+
+    candidate_lines = list(stdout_lines)
+    if stderr_file and stderr_file.is_file():
+        try:
+            with stderr_file.open(errors="replace") as f:
+                candidate_lines.extend(ln.rstrip() for ln in f)
+        except OSError:
+            pass
+
+    ignore_patterns = cfg["ignore_res"]
+    found_labels: List[str] = []
+    for line in candidate_lines:
+        if any(p.search(line) for p in ignore_patterns):
+            continue
+        stop = False
+        for rule in ERROR_CATALOG:
+            label = rule.match_label(line)
+            if label:
+                found_labels.append(label)
+                stop = rule.stop_scan
+                break  # highest-priority match for this line only
+        if stop:
+            break
+
+    # de-duplicate, preserving first-seen order
+    uniq_labels: List[str] = []
+    seen: Set[str] = set()
+    for lbl in found_labels:
+        if lbl not in seen:
+            uniq_labels.append(lbl)
+            seen.add(lbl)
+
+    # Low-information generic hits ("something raised an exception",
+    # "an ERROR line appeared somewhere") are only worth reporting when
+    # nothing more specific was also found in the same log.
+    GENERIC_LABELS = {"General error (ERROR)", "Unhandled Python exception"}
+    if any(lbl not in GENERIC_LABELS for lbl in uniq_labels):
+        uniq_labels = [lbl for lbl in uniq_labels if lbl not in GENERIC_LABELS]
+
+    if uniq_labels:
+        return False, " | ".join(uniq_labels)
+
+    if success:
+        return True, "successful"
+
+    return False, "no success marker in STDOUT"
+
+
+def extract_sid_and_date(fname: str, cfg: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """
+    Extract subject id (required) and date (optional) from a filename.
+    Raises ValueError if no subject id can be found at all.
+    """
+    sid_m = cfg["sid_re"].search(fname)
+    if not sid_m:
+        raise ValueError(f"Cannot find a subject id in {fname}")
+    date_m = cfg["date_re"].search(fname)
+    date_str = date_m.group("date") if date_m else None
+    return sid_m.group("sid"), date_str
+
+
+def log_in_range(run_date: Optional[str], cfg: Dict[str, Any]) -> bool:
+    """No date parsed => always include (can't filter what we can't date)."""
+    if run_date is None:
+        return True
+    try:
+        log_date = datetime.strptime(run_date, "%Y%m%d").date()
+    except ValueError:
+        return True
+    if cfg["date_start_dt"] and log_date < cfg["date_start_dt"]:
+        return False
+    if cfg["date_end_dt"] and log_date > cfg["date_end_dt"]:
+        return False
+    return True
+
+
+def build_deriv_index(cfg: Dict[str, Any], console: Console, debug: bool) -> Optional[Dict[str, Set[str]]]:
+    """
+    Pre-scan deriv_root once and build {study_or_'_all_': {sid, sid, ...}}.
+    Returns None if no deriv_root is configured (cross-check skipped),
+    or an (possibly empty) index otherwise.
+    """
+    if not cfg.get("deriv_root"):
+        return None
+
+    deriv_root = Path(cfg["deriv_root"]).expanduser()
+    if not deriv_root.is_dir():
+        console.print(f"[yellow]deriv_root does not exist, skipping derivatives cross-check:[/] {deriv_root}")
+        return None
+
+    patterns = cfg["deriv_pattern_res"]
+    subdirs = cfg.get("study_subdirs") or []
+    index: Dict[str, Set[str]] = {}
+
+    def scan(root: Path) -> Set[str]:
+        found: Set[str] = set()
+        try:
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                name = path.name
+                for pat in patterns:
+                    m = pat.search(name)
+                    if m and "sid" in m.groupdict():
+                        found.add(m.group("sid"))
+        except OSError as exc:
+            console.print(f"[yellow]Could not fully scan {root}: {exc}[/]")
+        return found
+
+    if subdirs:
+        for sub in subdirs:
+            subpath = deriv_root / sub
+            index[sub] = scan(subpath) if subpath.is_dir() else set()
+    else:
+        index["_all_"] = scan(deriv_root)
+
+    if debug:
+        for k, v in index.items():
+            console.print(f"[cyan]Derivatives index[/] {k}: {len(v)} subjects found")
+
+    return index
+
+
+def has_derivatives(sid: str, study: Optional[str], index: Optional[Dict[str, Set[str]]]) -> Optional[bool]:
+    """True/False if we can tell, None if the cross-check wasn't configured
+    or the study couldn't be matched to an indexed subdir."""
+    if index is None:
+        return None
+    if study and study in index:
+        return sid in index[study]
+    if "_all_" in index:
+        return sid in index["_all_"]
+    # study_subdirs was configured but this row's study doesn't match any
+    # of them -- we genuinely don't know, rather than assuming "missing".
+    return None
+
+
+# ----------------------------------------------------------------------
+# Main routine
+# ----------------------------------------------------------------------
+def main(argv: Optional[List[str]] = None) -> None:
+    cfg, args, console = initialize_cfg(argv)
+    debug = args.debug
+    log_root = Path(cfg["log_root"])
+    out_dir = Path(cfg["out_dir"])
+    err_suffix = cfg["err_suffix"]
+
+    glob_fn = log_root.rglob if cfg["log_recursive"] else log_root.glob
+    log_files = sorted(glob_fn(cfg["log_glob"]))
+    log_files = [p for p in log_files if not p.name.endswith(err_suffix)]
+    if args.include:
+        log_files = [p for p in log_files if args.include in p.name]
+    if args.exclude:
+        log_files = [p for p in log_files if args.exclude not in p.name]
+
+    if debug:
+        console.print(f"[cyan]log_root:[/] {log_root}")
+        console.print(f"[cyan]out_dir:[/] {out_dir}")
+        console.print(f"[cyan]Found {len(log_files)} candidate log file(s) before date filtering.[/]")
+
+    deriv_index = build_deriv_index(cfg, console, debug)
+
+    rows: List[Dict[str, object]] = []
+    skip_counts: Counter = Counter()
+    skip_examples: Dict[str, List[str]] = {}
+
+    def _note_skip(reason: str, fname: str) -> None:
+        skip_counts[reason] += 1
+        skip_examples.setdefault(reason, [])
+        if len(skip_examples[reason]) < 5:
+            skip_examples[reason].append(fname)
+
+    # First pass: record initial file stats, for the "is this still being
+    # written to" check further down.
+    initial_stats: Dict[Path, Tuple[int, float]] = {}
+    for p in log_files:
+        try:
+            st = p.stat()
+            initial_stats[p] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+
+    for stdout_path in tqdm(log_files, desc="Scanning logs", disable=debug):
+        try:
+            sid, run_date = extract_sid_and_date(stdout_path.name, cfg)
+        except ValueError:
+            # Filename didn't match sid_pattern. Rather than give up right
+            # away, check whether this even looks like an fMRIPrep log, and
+            # if so, try a few common id conventions against its content --
+            # useful for logs that use a subject-id convention the config
+            # hasn't been told about yet. Either way this is reported in
+            # aggregate below, not once per file.
+            head = _head_text(stdout_path)
+            if not looks_like_fmriprep_log(head):
+                _note_skip("not an fMRIPrep log", stdout_path.name)
+                continue
+            content_sid = sid_from_content(head)
+            if not content_sid:
+                _note_skip("fMRIPrep log, but no subject id found (check sid_pattern)", stdout_path.name)
+                continue
+            date_m = cfg["date_re"].search(stdout_path.name) or cfg["date_re"].search(head)
+            sid, run_date = content_sid, (date_m.group("date") if date_m else None)
+            if debug:
+                console.print(
+                    f"[cyan]{stdout_path.name}:[/] sid_pattern didn't match the filename; "
+                    f"extracted subject id '{sid}' from log content instead."
+                )
+
+        if not log_in_range(run_date, cfg):
+            continue
+
+        err_path = stdout_path.with_name(stdout_path.stem + err_suffix)
+        if not err_path.is_file():
+            err_path = None
+
+        try:
+            study = study_from_log(stdout_path, cfg)
+        except OSError as exc:
+            console.print(f"[yellow]Could not read {stdout_path.name}: {exc}[/]")
+            study = None
+
+        try:
+            success_log, log_msg = parse_log_pair(stdout_path, err_path, cfg)
+        except OSError as exc:
+            _note_skip(f"read error ({exc})", stdout_path.name)
+            continue
+
+        is_candidate_active = (not success_log) and (log_msg == "no success marker in STDOUT")
+
+        status = "Unfinished"
+        message = log_msg
+
+        if success_log:
+            status = "Successful"
+            message = "successful"
+        elif not is_candidate_active:
+            status = "Failed"
+            message = log_msg
+        else:
+            # --- second peek: is something actively still writing? -----
+            initial_size, _initial_mtime = initial_stats.get(stdout_path, (0, 0))
+            try:
+                curr_stat = stdout_path.stat()
+                curr_size, curr_mtime = curr_stat.st_size, curr_stat.st_mtime
+            except OSError:
+                curr_size, curr_mtime = 0, 0
+
+            is_recent = (time.time() - curr_mtime) < 1800  # 30 minutes
+
+            if is_recent and curr_size == initial_size:
+                time.sleep(1.0)
+                try:
+                    curr_size = stdout_path.stat().st_size
+                except OSError:
+                    pass
+
+            if curr_size > initial_size:
+                status, message = "In Progress", "actively writing to log"
+            elif is_recent:
+                status, message = "In Progress", "recently modified (likely in progress)"
+            else:
+                status, message = "Unfinished", "stopped without success marker"
+
+        deriv_ok = has_derivatives(sid, study, deriv_index) if status == "Successful" else None
+        if status == "Successful" and deriv_ok is False:
+            message = "successful, but no matching derivatives found on disk"
+
+        rows.append(
+            {
+                "subject": sid,
+                "run_date": run_date or "",
+                "study": study,
+                "status": status,
+                "derivatives_found": deriv_ok,
+                "message": message,
+                "stdout_path": str(stdout_path.relative_to(log_root)),
+                "stderr_path": str(err_path.relative_to(log_root)) if err_path else "",
+            }
+        )
+
+    if skip_counts:
+        console.print("")
+        for reason, count in skip_counts.items():
+            examples = skip_examples[reason]
+            extra = count - len(examples)
+            more = f" ... and {extra} more" if extra > 0 else ""
+            console.print(f"[yellow]{count} file(s) skipped -- {reason}:[/] {', '.join(examples)}{more}")
+
+    if not rows:
+        console.print(f"\n[red]No usable log files found in[/] {log_root}")
+        console.print(f"  {len(log_files)} file(s) matched glob '{cfg['log_glob']}'"
+                       + (" (recursively)" if cfg["log_recursive"] else "") + ".")
+        console.print(f"  Current sid_pattern: {cfg['sid_pattern']!r}")
+        console.print(f"  Current date_pattern: {cfg['date_pattern']!r}")
+        if log_files:
+            console.print(f"  Example filename that didn't match: {log_files[0].name}")
+        console.print("  If these are fMRIPrep logs with a different naming convention, "
+                       "set sid_pattern/date_pattern in a config file.")
+        sys.exit(1)
+
+    df = pd.DataFrame(rows)
+    df.sort_values(["subject", "run_date"], inplace=True)
+
+    out_csv = out_dir / "fmriprep_run_summary.csv"
+    df.to_csv(out_csv, index=False)
+    console.print(f"\n[green]Summary written to[/] {out_csv}")
+
+    # Per-subject rollup: latest attempt + attempt count.
+    latest = (
+        df.sort_values(["subject", "run_date"])
+        .groupby("subject", as_index=False)
+        .agg(
+            attempts=("run_date", "count"),
+            latest_run_date=("run_date", "max"),
+        )
+    )
+    latest_status = df.sort_values(["subject", "run_date"]).groupby("subject").tail(1)
+    latest = latest.merge(
+        latest_status[["subject", "status", "message", "study"]],
+        on="subject",
+        how="left",
+    )
+    out_subject_csv = out_dir / "fmriprep_subject_summary.csv"
+    latest.to_csv(out_subject_csv, index=False)
+    console.print(f"[green]Per-subject summary written to[/] {out_subject_csv}")
+
+    display_df = df
+    only_map = {
+        "successful": "Successful",
+        "failed": "Failed",
+        "in-progress": "In Progress",
+        "unfinished": "Unfinished",
+    }
+    if args.only != "all":
+        display_df = df[df["status"] == only_map[args.only]]
+
+    _print_terminal_table(console, display_df, cfg["html_title"])
+    _write_html_report(display_df, log_root, out_dir, cfg["html_title"], console)
+
+
+def _disp(val: Any, default: str = "\u2014") -> Any:
+    """
+    Render a possibly-missing value for display. Needed because pandas can
+    hand back None, NaN (float), or "" for "no value" depending on column
+    dtype -- and plain `val or default` gets this wrong for NaN, since
+    float('nan') is truthy in Python.
+    """
+    if val is None:
+        return default
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    if val == "":
+        return default
+    return val
+
+
+def _status_display(status: str, plain: bool = False) -> str:
+    icons = {
+        "Successful": ("green", "\u2714 Successful"),
+        "Failed": ("red", "\u274c Failed"),
+        "In Progress": ("blue", "\u23f3 In Progress"),
+    }
+    color, text = icons.get(status, ("yellow", "\u23f9 Unfinished"))
+    if plain:
+        return text
+    return f"[{color}]{text}[/]"
+
+
+def _print_terminal_table(console: Console, df: pd.DataFrame, title: str) -> None:
+    if Table is None:
+        console.print(f"\n{title}")
+        console.print(df.to_string(index=False))
+        return
+
+    t = Table(title=title)
+    t.add_column("Subject", style="cyan", no_wrap=True)
+    t.add_column("Run Date", style="magenta")
+    t.add_column("Study", style="green")
+    t.add_column("Status", justify="center", style="bold", width=15)
+    t.add_column("Message", style="yellow")
+
+    for _, r in df.iterrows():
+        t.add_row(
+            r["subject"],
+            r["run_date"],
+            _disp(r["study"]),
+            _status_display(r["status"]),
+            _disp(r["message"]),
+        )
+    console.print("\n")
+    console.print(t)
+
+
+def _rel_link(log_root: Path, out_dir: Path, rel_to_log_root: str) -> str:
+    """
+    stdout_path/stderr_path in the dataframe are stored relative to
+    log_root (for a short, portable CSV). The HTML report, though, lives in
+    out_dir, which is not necessarily log_root itself (by default it's
+    log_root's *parent*) -- so a link needs to be relative to out_dir, not
+    log_root, or it'll resolve one level off whenever the two differ.
+    """
+    abs_path = log_root / rel_to_log_root
+    try:
+        return os.path.relpath(abs_path, start=out_dir)
+    except ValueError:
+        # e.g. different drives on Windows -- fall back to an absolute path.
+        return str(abs_path)
+
+
+def _write_html_report(df: pd.DataFrame, log_root: Path, out_dir: Path, title: str, console: Console) -> None:
+    html_path = out_dir / "fmriprep_run_report.html"
+    try:
+        rows_html = []
+        for _, r in df.iterrows():
+            stdout_rel = _disp(r["stdout_path"], default="")
+            stderr_rel = _disp(r["stderr_path"], default="")
+            stdout_cell = f'<a href="{_rel_link(log_root, out_dir, stdout_rel)}">log</a>' if stdout_rel else "\u2014"
+            stderr_cell = f'<a href="{_rel_link(log_root, out_dir, stderr_rel)}">err</a>' if stderr_rel else "\u2014"
+            rows_html.append(
+                "<tr data-status=\"{status}\">"
+                "<td>{subject}</td><td>{run_date}</td><td>{study}</td>"
+                "<td>{status_disp}</td><td>{message}</td>"
+                "<td>{stdout}</td><td>{stderr}</td>"
+                "</tr>".format(
+                    status=r["status"],
+                    subject=r["subject"],
+                    run_date=r["run_date"],
+                    study=_disp(r["study"]),
+                    status_disp=_status_display(r["status"], plain=True),
+                    message=_disp(r["message"]),
+                    stdout=stdout_cell,
+                    stderr=stderr_cell,
+                )
+            )
+
+        body = "\n".join(rows_html)
+        html = f"""<html><head><meta charset="utf-8"><title>{title}</title>
+<style>
+  body {{ font-family: Arial, Helvetica, sans-serif; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+  tr:nth-child(even) {{ background-color: #f2f2f2; }}
+  tr:hover {{ background-color: #ddd; }}
+  th {{ padding: 12px 8px; background-color: #4CAF50; color: white; cursor: pointer; }}
+  select {{ margin: 0 0 10px 0; padding: 4px; }}
+</style>
+</head><body>
+<h2>{title}</h2>
+<label for="statusFilter">Filter: </label>
+<select id="statusFilter" onchange="filterTable()">
+  <option value="all">All</option>
+  <option value="Successful">Successful</option>
+  <option value="Failed">Failed</option>
+  <option value="In Progress">In Progress</option>
+  <option value="Unfinished">Unfinished</option>
+</select>
+<table id="reportTable">
+<thead><tr>
+  <th onclick="sortTable(0)">Subject</th>
+  <th onclick="sortTable(1)">Run Date</th>
+  <th onclick="sortTable(2)">Study</th>
+  <th onclick="sortTable(3)">Status</th>
+  <th onclick="sortTable(4)">Message</th>
+  <th>stdout</th>
+  <th>stderr</th>
+</tr></thead>
+<tbody>
+{body}
+</tbody>
+</table>
+<script>
+function filterTable() {{
+  var val = document.getElementById('statusFilter').value;
+  var rows = document.querySelectorAll('#reportTable tbody tr');
+  rows.forEach(function(row) {{
+    row.style.display = (val === 'all' || row.dataset.status === val) ? '' : 'none';
+  }});
+}}
+var sortDirs = {{}};
+function sortTable(col) {{
+  var table = document.getElementById('reportTable');
+  var tbody = table.tBodies[0];
+  var rows = Array.prototype.slice.call(tbody.rows);
+  var dir = sortDirs[col] = !sortDirs[col];
+  rows.sort(function(a, b) {{
+    var x = a.cells[col].innerText.trim();
+    var y = b.cells[col].innerText.trim();
+    return dir ? x.localeCompare(y) : y.localeCompare(x);
+  }});
+  rows.forEach(function(r) {{ tbody.appendChild(r); }});
+}}
+</script>
+</body></html>"""
+        with html_path.open("w") as f:
+            f.write(html)
+        console.print(f"[green]HTML report written to[/] {html_path}")
+    except Exception as exc:
+        console.print(f"[red]Could not write HTML report: {exc}[/]")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(130)
