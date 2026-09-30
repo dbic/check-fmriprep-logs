@@ -1,0 +1,32 @@
+# Example config reproducing the settings that used to be hardcoded as
+# defaults in check_fmriprep_logs.py, for the WASABI project specifically.
+#
+# Usage:
+#   python check_fmriprep_logs.py --config wasabi.example.yaml
+#
+# or copy this to ./fmriprep_log_check.yaml in the directory you normally
+# run the script from, and it'll be picked up automatically with no flags.
+
+log_root: /dartfs-hpc/rc/home/t/d78092t/logfiles/WASABI
+
+# WASABI log filenames look like: 20260801-143000_sid1234_something.txt
+# i.e. date-time first, "sid<digits>" second. sid_pattern and date_pattern
+# are searched independently, so order/format on either side doesn't matter.
+sid_pattern: '(?i:sid)(?P<sid>\d+)'
+date_pattern: '^(?P<date>\d{8})-\d{6}'
+
+deriv_root: /vast/labs/DBIC/pending-deletion/WASABI/derivatives/fmriprep-25.2.3
+study_subdirs:
+  - 1080_wasabi
+  - 1102_MedMap
+
+bids_path_map:
+  - bids_root: /dartfs-hpc/rc/lab/C/CANlab/labdata/data/WASABI/1102_MedMap
+    study: 1102_MedMap
+  - bids_root: /dartfs-hpc/rc/lab/C/CANlab/labdata/data/WASABI/1080_wasabi
+    study: 1080_wasabi
+
+deriv_patterns:
+  - 'sub-(?P<sid>\w+).*_desc-preproc_T1w\.nii\.gz$'
+
+html_title: WASABI fMRIPrep Log Audit
